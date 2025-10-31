@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 from openai import AuthenticationError, RateLimitError, APIConnectionError, APIStatusError
+import random
 import re
+import json
 
 
 def generate_outline(topic: str, heading: str, target_word_count: int) -> List[Dict[str, Any]]:
@@ -15,18 +17,15 @@ def generate_outline(topic: str, heading: str, target_word_count: int) -> List[D
     min_sections = 5
     max_sections = 10
 
-    # Determine number of H2 sections heuristically
     if target_word_count <= 700:
         num_h2 = min_sections
     elif target_word_count >= 3000:
         num_h2 = max_sections
     else:
-        # scale between min and max
         span = max_sections - min_sections
         ratio = (target_word_count - 700) / (3000 - 700)
         num_h2 = min(max_sections, max(min_sections, int(min_sections + ratio * span)))
 
-    # Allocate words: reserve ~12% for intro and ~12% for conclusion
     intro_words = max(120, int(target_word_count * 0.12))
     conclusion_words = max(120, int(target_word_count * 0.12))
     body_words = max(200, target_word_count - intro_words - conclusion_words)
@@ -36,7 +35,6 @@ def generate_outline(topic: str, heading: str, target_word_count: int) -> List[D
     outline: List[Dict[str, Any]] = []
     outline.append({"level": "h2", "title": "Introduction", "target_words": intro_words})
 
-    # Basic section suggestions based on topic
     core_sections = [
         f"Understanding {topic}",
         f"Key Benefits of {topic}",
@@ -49,14 +47,13 @@ def generate_outline(topic: str, heading: str, target_word_count: int) -> List[D
         f"Real-World Examples and Case Studies",
     ]
     i = 0
-    while len([s for s in outline if s["level"] == "h2"]) - 1 < num_h2:  # minus intro
+    while len([s for s in outline if s["level"] == "h2"]) - 1 < num_h2:
         title = core_sections[i % len(core_sections)]
         outline.append({"level": "h2", "title": title, "target_words": per_section})
         i += 1
 
     outline.append({"level": "h2", "title": "Conclusion", "target_words": conclusion_words})
 
-    # Add varied H3 subsections under selected H2 sections to avoid repetition
     h3_variants = ["Key Takeaways", "Action Steps", "Quick Checklist", "Pro Tips", "Summary Points"]
     h2_indices = [idx for idx, s in enumerate(outline) if s["level"] == "h2" and s["title"] not in {"Introduction", "Conclusion"}]
     for j, h2_idx in enumerate(h2_indices[: max(1, len(h2_indices)//3)]):
@@ -66,10 +63,54 @@ def generate_outline(topic: str, heading: str, target_word_count: int) -> List[D
     return outline
 
 
+# ---------- Evidence tagging (Researcher) ----------
+
+def build_tagged_evidence(research: Dict[str, Any]) -> List[str]:
+    items: List[str] = []
+    for s in research.get("sources", [])[:12]:
+        title = (s.get("title") or "").strip()
+        snippet = (s.get("snippet") or "").strip()
+        text = f"{title} — {snippet}".strip(" —")
+        if not text:
+            continue
+        tag = ""
+        if re.search(r"\b\d{1,3}%|\b\d{4}\b|\b\d+[,.]\d+\b", text):
+            tag = "[stat]"
+        elif '“' in text or '”' in text or '"' in text:
+            tag = "[quote]"
+        elif any(k in text.lower() for k in ["case study", "case", "example"]):
+            tag = "[case]"
+        elif any(k in text.lower() for k in ["tool", "platform", "software", "suite"]):
+            tag = "[tool]"
+        else:
+            tag = "[stat]" if re.search(r"\b\d+\b", text) else "[case]"
+        items.append(f"{tag} {text}")
+    uniq: List[str] = []
+    seen = set()
+    for it in items:
+        if it not in seen:
+            seen.add(it)
+            uniq.append(it)
+    return uniq[:12]
+
+
+# ---------- Structure template & micro-styles (Composer) ----------
+
+def select_structure_template(seed: Optional[int] = None) -> str:
+    random.seed(seed)
+    templates = ["Analytical Guide", "Practical Playbook", "Thought Leadership", "Case Study", "Hybrid Narrative"]
+    return random.choice(templates)
+
+
+def choose_micro_style(idx: int) -> str:
+    styles = ["story hook", "stat+insight", "example walkthrough", "micro-interview quote", "guided checklist"]
+    return styles[idx % len(styles)]
+
+
 def _build_system_prompt() -> str:
     return (
-        "You are a professional SEO blog writer. Write engaging, factual, and structured content. "
-        "Follow proper heading hierarchy and integrate keywords naturally. Maintain clarity, accuracy, and usefulness."
+        "You are a professional SEO blog writer and editor. Generate human-sounding, non-templated content. "
+        "Never output raw Markdown tokens like ## or **. Use plain prose and bullet lines only when needed."
     )
 
 
@@ -81,34 +122,28 @@ def _build_user_prompt(
     target_word_count: int,
     audience: Optional[str],
     research: Dict[str, Any],
+    structure_template: str,
+    micro_style: str,
 ) -> str:
-    """Build a prompt for a single section using research as context."""
-    sources = research.get("sources", [])
-    insights = research.get("insights", [])
-    keywords = research.get("keywords", [])
-
-    ref_lines: List[str] = []
-    for s in sources[:6]:
-        if s.get("title") and s.get("url"):
-            ref_lines.append(f"- {s['title']} ({s['url']})")
+    evidence = build_tagged_evidence(research)
 
     audience_note = f" for {audience}" if audience else ""
 
-    extra_guidance = (
-        "When relevant, include one short inspirational quote (as a single blockquote line starting with '>'). "
-        "If the content benefits from comparison or listing, add a small 2-3 column table using pipe '|' separators with a header row. "
-        "Avoid repeating the same subheadings or phrases across sections; prefer fresh wording."
+    guidelines = (
+        "Rules: Use an engaging opener; vary sentence openings and lengths; prefer active voice; 2-4 sentence paragraphs; "
+        "avoid repeating phrases across sections; no raw Markdown tokens; bullets only when valuable; weave keywords naturally."
+    )
+
+    micro_style_note = (
+        f"Use micro-style: {micro_style}. If possible, anchor with one of [stat, quote, case, tool] from evidence."
     )
 
     return (
-        f"Write a {target_word_count}-word section for the article '{heading}'.\n"
-        f"Section: {level.upper()} - {section_title}.\n"
-        f"Audience: produce approachable, professional writing{audience_note}.\n"
-        f"Incorporate relevant insights and keywords naturally.\n\n"
-        f"Insights to consider:\n" + ("\n".join([f"- {i}" for i in insights[:10]]) or "- None") + "\n\n"
-        f"Suggested keywords:\n" + (", ".join(keywords[:12]) or "None") + "\n\n"
-        f"{extra_guidance}\n"
-        f"Avoid fluff. Prefer clear explanations, examples, and step-by-step guidance where appropriate.\n"
+        f"Article: '{heading}' using template '{structure_template}'.\n"
+        f"Section: {level.upper()} - {section_title}. Target ~{target_word_count} words. Audience: professionals{audience_note}.\n"
+        f"{guidelines}\n{micro_style_note}\n\n"
+        f"Evidence (distinct items):\n" + ("\n".join(evidence) if evidence else "- none") + "\n\n"
+        f"Write the section now in clean prose (no markdown symbols)."
     )
 
 
@@ -121,8 +156,9 @@ def generate_section_text(
     target_word_count: int,
     research: Dict[str, Any],
     audience: Optional[str] = None,
+    structure_template: Optional[str] = None,
+    micro_style: Optional[str] = None,
 ) -> str:
-    """Generate one section of the article using OpenAI."""
     client = OpenAI(api_key=openai_api_key)
 
     system_prompt = _build_system_prompt()
@@ -134,6 +170,8 @@ def generate_section_text(
         target_word_count=target_word_count,
         audience=audience,
         research=research,
+        structure_template=structure_template or select_structure_template(),
+        micro_style=micro_style or choose_micro_style(0),
     )
 
     try:
@@ -144,23 +182,16 @@ def generate_section_text(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.7,
+            top_p=0.9,
         )
     except AuthenticationError as e:
-        raise RuntimeError(
-            "OpenAI authentication failed. Verify OPENAI_API_KEY is correct (create a new secret key if needed)."
-        ) from e
+        raise RuntimeError("OpenAI authentication failed. Verify OPENAI_API_KEY is correct.") from e
     except RateLimitError as e:
-        raise RuntimeError(
-            "OpenAI rate limit reached. Please wait and try again, or reduce concurrency."
-        ) from e
+        raise RuntimeError("OpenAI rate limit reached. Please wait and try again.") from e
     except APIConnectionError as e:
-        raise RuntimeError(
-            "Network error communicating with OpenAI API. Check your internet connection and retry."
-        ) from e
+        raise RuntimeError("Network error communicating with OpenAI API. Check your connection.") from e
     except APIStatusError as e:
-        raise RuntimeError(
-            f"OpenAI API returned an error: {getattr(e, 'message', str(e))}"
-        ) from e
+        raise RuntimeError(f"OpenAI API returned an error: {getattr(e, 'message', str(e))}") from e
     except Exception as e:
         raise RuntimeError("Unexpected error during content generation.") from e
 
@@ -168,21 +199,22 @@ def generate_section_text(
     return text.strip()
 
 
+# ---------- Polishing helpers ----------
+
 def _strip_markdown_headings(text: str) -> str:
-    """Remove leading Markdown heading markers from lines."""
     lines = []
     for line in text.splitlines():
         line = re.sub(r"^(#{1,6})\s+", "", line)
+        line = line.replace("**", "")
         lines.append(line)
     return "\n".join(lines)
 
 
 def summarize_key_takeaways(openai_api_key: str, section_title: str, section_text: str) -> List[str]:
-    """Use OpenAI to produce 3-5 concise bullet takeaways for a section."""
     client = OpenAI(api_key=openai_api_key)
     prompt = (
         "Summarize the following section into 3-5 concise, actionable key takeaways. "
-        "Return as plain bullets without numbering, each on a new line.\n\n"
+        "Return as plain bullets without numbering, each on a new line. No markdown symbols.\n\n"
         f"Section: {section_title}\n\n"
         f"Content:\n{section_text}\n"
     )
@@ -194,18 +226,17 @@ def summarize_key_takeaways(openai_api_key: str, section_title: str, section_tex
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
+            top_p=0.6,
         )
         out = (completion.choices[0].message.content or "").strip()
         bullets = [b.strip("- ") for b in out.splitlines() if b.strip()]
         return [b for b in bullets if b][:5]
     except Exception:
-        # Fallback minimal heuristic
         sents = [s.strip() for s in re.split(r"[.!?]", section_text) if len(s.strip()) > 0]
         return [s for s in sents[:5]]
 
 
 def polish_sections(openai_api_key: str, sections: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Refine sections: remove markdown headings and add Key Takeaways after each H2 section."""
     polished: List[Dict[str, str]] = []
     for s in sections:
         clean_text = _strip_markdown_headings(s.get("text", ""))
@@ -216,3 +247,111 @@ def polish_sections(openai_api_key: str, sections: List[Dict[str, str]]) -> List
                 bullet_text = "\n".join([f"- {b}" for b in bullets])
                 polished.append({"title": "Key Takeaways", "level": "h3", "text": bullet_text})
     return polished
+
+
+# ---------- Semantic dedupe/paraphrase (Editor) ----------
+
+def embed_paragraphs(client: OpenAI, texts: List[str]) -> List[List[float]]:
+    resp = client.embeddings.create(model="text-embedding-3-small", input=texts)
+    return [d.embedding for d in resp.data]
+
+
+def cosine_sim(a: List[float], b: List[float]) -> float:
+    import math
+    dot = sum(x*y for x, y in zip(a, b))
+    na = math.sqrt(sum(x*x for x in a))
+    nb = math.sqrt(sum(y*y for y in b))
+    return 0.0 if na == 0 or nb == 0 else dot / (na * nb)
+
+
+def paraphrase_text(client: OpenAI, text: str) -> str:
+    prompt = (
+        "Rewrite the following to avoid duplicated phrasing while preserving meaning. "
+        "Keep it concise, natural, and professional. No markdown symbols.\n\n" + text
+    )
+    out = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "system", "content": "You are a senior editor."}, {"role": "user", "content": prompt}],
+        temperature=0.4,
+        top_p=0.7,
+    )
+    return (out.choices[0].message.content or text).strip()
+
+
+def dedupe_and_paraphrase_sections(openai_api_key: str, sections: List[Dict[str, str]], threshold: float = 0.9) -> List[Dict[str, str]]:
+    client = OpenAI(api_key=openai_api_key)
+    texts = [s["text"] for s in sections]
+    embs = embed_paragraphs(client, texts)
+
+    keep: List[Dict[str, str]] = []
+    for i, sec in enumerate(sections):
+        duplicate = False
+        for kept in keep:
+            kept_emb = embed_paragraphs(client, [kept["text"]])[0]
+            sim = cosine_sim(embs[i], kept_emb)
+            if sim >= threshold:
+                new_text = paraphrase_text(client, sec["text"])[:]
+                sec = {**sec, "text": new_text}
+                duplicate = True
+                break
+        keep.append(sec)
+    return keep
+
+
+# ---------- Micro-refinement pass (global article) ----------
+
+def micro_refine_article(
+    openai_api_key: str,
+    heading: str,
+    metadata: Dict[str, Any],
+    sections: List[Dict[str, str]],
+    audience: Optional[str] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+    """Apply micro-refinement: opener variety, rhythm, list/table variation, micro-insights, and meta/closing polish.
+    Returns potentially updated metadata and refined sections.
+    """
+    client = OpenAI(api_key=openai_api_key)
+
+    article = {
+        "heading": heading,
+        "metadata": metadata,
+        "audience": audience or "",
+        "sections": sections,
+    }
+
+    directive = (
+        "Apply MICRO-REFINEMENT: \n"
+        "A) Section openers: no two share same first 3 words; vary opener types across temporal/rhetorical/contrast/data/story (>=3 styles).\n"
+        "B) Rhythm: alternate short/long sentences; add transitions; include one rhetorical question, one contrast phrase, one reflective line.\n"
+        "C) Lists/Tables: vary representation (numbered, narrative, 2-col table, checklist); randomize verb starters.\n"
+        "D) Micro-insights: insert 1-sentence insights or mini-quotes between sections, not templated.\n"
+        "E) Meta/closing: simplify meta to avoid echo; add pre-conclusion bridge; warm human outro.\n"
+        "F) Quality: ensure diversity of length/layout; <2 repeated phrases; include one micro-story, one data point, one rhetorical question.\n"
+        "Do not use markdown symbols. Return strict JSON with fields: {metadata, sections:[{title, level, text}]}."
+    )
+
+    msg = (
+        "Here is the article to refine (JSON):\n" + json.dumps(article, ensure_ascii=False) + "\n\n" + directive
+    )
+
+    out = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a meticulous senior editor and formatter."},
+            {"role": "user", "content": msg},
+        ],
+        temperature=0.6,
+        top_p=0.9,
+    )
+
+    content = out.choices[0].message.content or ""
+    try:
+        data = json.loads(content)
+        new_meta = data.get("metadata", metadata)
+        new_sections = data.get("sections", sections)
+        # Basic validation
+        if isinstance(new_meta, dict) and isinstance(new_sections, list):
+            return new_meta, new_sections
+        return metadata, sections
+    except Exception:
+        return metadata, sections

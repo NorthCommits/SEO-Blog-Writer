@@ -11,7 +11,15 @@ from dotenv import load_dotenv
 
 from src.research import perform_research
 from src.seo import generate_metadata, slugify
-from src.content import generate_outline, generate_section_text, polish_sections
+from src.content import (
+    generate_outline,
+    generate_section_text,
+    polish_sections,
+    select_structure_template,
+    choose_micro_style,
+    dedupe_and_paraphrase_sections,
+    micro_refine_article,
+)
 from src.export import export_txt, export_docx, export_pdf
 
 
@@ -106,6 +114,9 @@ def cli(topic: str, heading: str, word_count: int, deep: str, output_format: str
     print("Generating content...")
     sections = [s for s in outline if s["level"] in {"h2", "h3"}]
 
+    # Select a varied structure template once; rotate micro-styles per section
+    structure_template = select_structure_template()
+
     generated_sections: List[Dict[str, str]] = []
     for idx, section in enumerate(sections, start=1):
         print(f"Writing section {idx}/{len(sections)}: {section['title']}")
@@ -119,6 +130,8 @@ def cli(topic: str, heading: str, word_count: int, deep: str, output_format: str
                 target_word_count=section["target_words"],
                 research=research,
                 audience=audience or None,
+                structure_template=structure_template,
+                micro_style=choose_micro_style(idx - 1),
             )
         except RuntimeError as e:
             print(str(e))
@@ -126,11 +139,18 @@ def cli(topic: str, heading: str, word_count: int, deep: str, output_format: str
             sys.exit(1)
         generated_sections.append({"title": section["title"], "level": section["level"], "text": text})
 
+    # Deduplicate and paraphrase prior to polishing
+    print("De-duplicating and paraphrasing similar sections...")
+    generated_sections = dedupe_and_paraphrase_sections(openai_key, generated_sections, threshold=0.9)
+
     # Optional polishing
     if polish:
         print("Polishing content and adding Key Takeaways...")
         generated_sections = polish_sections(openai_key, generated_sections)
-        # Enforce Times New Roman style tiers
+        print("Applying micro-refinement for opener variety and rhythm...")
+        metadata, generated_sections = micro_refine_article(
+            openai_key, heading, metadata, generated_sections, audience or None
+        )
         font_family = "Times-Roman"
         base_font_size = 11
         h1_size = 20
