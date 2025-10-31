@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 from openai import AuthenticationError, RateLimitError, APIConnectionError, APIStatusError
+import re
 
 
 def generate_outline(topic: str, heading: str, target_word_count: int) -> List[Dict[str, Any]]:
@@ -55,10 +56,12 @@ def generate_outline(topic: str, heading: str, target_word_count: int) -> List[D
 
     outline.append({"level": "h2", "title": "Conclusion", "target_words": conclusion_words})
 
-    # Add a small number of H3 subsections under selected H2 sections
+    # Add varied H3 subsections under selected H2 sections to avoid repetition
+    h3_variants = ["Key Takeaways", "Action Steps", "Quick Checklist", "Pro Tips", "Summary Points"]
     h2_indices = [idx for idx, s in enumerate(outline) if s["level"] == "h2" and s["title"] not in {"Introduction", "Conclusion"}]
-    for h2_idx in h2_indices[: max(1, len(h2_indices)//3)]:
-        outline.insert(h2_idx + 1, {"level": "h3", "title": "Key Takeaways", "target_words": max(80, int(per_section * 0.35))})
+    for j, h2_idx in enumerate(h2_indices[: max(1, len(h2_indices)//3)]):
+        subtitle = h3_variants[j % len(h3_variants)]
+        outline.insert(h2_idx + 1, {"level": "h3", "title": subtitle, "target_words": max(80, int(per_section * 0.35))})
 
     return outline
 
@@ -84,13 +87,18 @@ def _build_user_prompt(
     insights = research.get("insights", [])
     keywords = research.get("keywords", [])
 
-    # We include a constrained set of references and insights to guide the model
     ref_lines: List[str] = []
     for s in sources[:6]:
         if s.get("title") and s.get("url"):
             ref_lines.append(f"- {s['title']} ({s['url']})")
 
     audience_note = f" for {audience}" if audience else ""
+
+    extra_guidance = (
+        "When relevant, include one short inspirational quote (as a single blockquote line starting with '>'). "
+        "If the content benefits from comparison or listing, add a small 2-3 column table using pipe '|' separators with a header row. "
+        "Avoid repeating the same subheadings or phrases across sections; prefer fresh wording."
+    )
 
     return (
         f"Write a {target_word_count}-word section for the article '{heading}'.\n"
@@ -99,7 +107,7 @@ def _build_user_prompt(
         f"Incorporate relevant insights and keywords naturally.\n\n"
         f"Insights to consider:\n" + ("\n".join([f"- {i}" for i in insights[:10]]) or "- None") + "\n\n"
         f"Suggested keywords:\n" + (", ".join(keywords[:12]) or "None") + "\n\n"
-        f"Cite ideas to sources only when necessary; do not include explicit citation markers.\n"
+        f"{extra_guidance}\n"
         f"Avoid fluff. Prefer clear explanations, examples, and step-by-step guidance where appropriate.\n"
     )
 
@@ -158,3 +166,53 @@ def generate_section_text(
 
     text = completion.choices[0].message.content or ""
     return text.strip()
+
+
+def _strip_markdown_headings(text: str) -> str:
+    """Remove leading Markdown heading markers from lines."""
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"^(#{1,6})\s+", "", line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def summarize_key_takeaways(openai_api_key: str, section_title: str, section_text: str) -> List[str]:
+    """Use OpenAI to produce 3-5 concise bullet takeaways for a section."""
+    client = OpenAI(api_key=openai_api_key)
+    prompt = (
+        "Summarize the following section into 3-5 concise, actionable key takeaways. "
+        "Return as plain bullets without numbering, each on a new line.\n\n"
+        f"Section: {section_title}\n\n"
+        f"Content:\n{section_text}\n"
+    )
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a precise editor."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+        )
+        out = (completion.choices[0].message.content or "").strip()
+        bullets = [b.strip("- ") for b in out.splitlines() if b.strip()]
+        return [b for b in bullets if b][:5]
+    except Exception:
+        # Fallback minimal heuristic
+        sents = [s.strip() for s in re.split(r"[.!?]", section_text) if len(s.strip()) > 0]
+        return [s for s in sents[:5]]
+
+
+def polish_sections(openai_api_key: str, sections: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Refine sections: remove markdown headings and add Key Takeaways after each H2 section."""
+    polished: List[Dict[str, str]] = []
+    for s in sections:
+        clean_text = _strip_markdown_headings(s.get("text", ""))
+        polished.append({"title": s["title"], "level": s["level"], "text": clean_text})
+        if s["level"] == "h2":
+            bullets = summarize_key_takeaways(openai_api_key, s["title"], clean_text)
+            if bullets:
+                bullet_text = "\n".join([f"- {b}" for b in bullets])
+                polished.append({"title": "Key Takeaways", "level": "h3", "text": bullet_text})
+    return polished

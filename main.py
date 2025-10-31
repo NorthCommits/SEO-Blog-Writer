@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 from src.research import perform_research
 from src.seo import generate_metadata, slugify
-from src.content import generate_outline, generate_section_text
+from src.content import generate_outline, generate_section_text, polish_sections
 from src.export import export_txt, export_docx, export_pdf
 
 
@@ -21,7 +21,6 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 def ensure_output_dir() -> None:
     """Ensure output directory exists and is writable."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    # basic writability check
     test_path = os.path.join(OUTPUT_DIR, ".write_test")
     try:
         with open(test_path, "w", encoding="utf-8") as f:
@@ -56,7 +55,19 @@ def require_env(name: str) -> str:
 @click.option(
     "--audience", prompt="Target audience (optional)", default="",
 )
-def cli(topic: str, heading: str, word_count: int, deep: str, output_format: str, audience: str) -> None:
+@click.option(
+    "--font_family", default="Open Sans", show_default=True,
+    type=click.Choice(["Open Sans", "Helvetica", "Times-Roman"], case_sensitive=False),
+    help="Base font family for DOCX/PDF. 'Open Sans' requires TTFs in fonts/."
+)
+@click.option("--base_font_size", default=11, show_default=True, type=int, help="Base body font size.")
+@click.option("--h1_size", default=18, show_default=True, type=int, help="H1 font size.")
+@click.option("--h2_size", default=14, show_default=True, type=int, help="H2 font size.")
+@click.option("--h3_size", default=12, show_default=True, type=int, help="H3 font size.")
+@click.option("--polish", is_flag=True, default=False, help="Enable editorial polishing and Times New Roman style system.")
+
+def cli(topic: str, heading: str, word_count: int, deep: str, output_format: str, audience: str,
+        font_family: str, base_font_size: int, h1_size: int, h2_size: int, h3_size: int, polish: bool) -> None:
     """CLI entry to generate a professional SEO blog post."""
     load_dotenv()
 
@@ -115,42 +126,32 @@ def cli(topic: str, heading: str, word_count: int, deep: str, output_format: str
             sys.exit(1)
         generated_sections.append({"title": section["title"], "level": section["level"], "text": text})
 
-    # Assemble final text
-    full_text_lines: List[str] = []
-    full_text_lines.append("SEO Metadata")
-    full_text_lines.append(f"Title Tag: {metadata['title_tag']}")
-    full_text_lines.append(f"Meta Description: {metadata['meta_description']}")
-    full_text_lines.append("Primary Keywords: " + ", ".join(metadata["primary_keywords"]))
-    full_text_lines.append("Secondary Keywords: " + ", ".join(metadata["secondary_keywords"]))
-    full_text_lines.append(f"URL Slug: {metadata['url_slug']}")
-    full_text_lines.append("")
+    # Optional polishing
+    if polish:
+        print("Polishing content and adding Key Takeaways...")
+        generated_sections = polish_sections(openai_key, generated_sections)
+        # Enforce Times New Roman style tiers
+        font_family = "Times-Roman"
+        base_font_size = 11
+        h1_size = 20
+        h2_size = 15
+        h3_size = 13
 
-    # Article
-    full_text_lines.append(f"H1: {heading}")
-    full_text_lines.append("")
-    for sec in generated_sections:
-        if sec["level"] == "h2":
-            full_text_lines.append(f"H2: {sec['title']}")
-        else:
-            full_text_lines.append(f"H3: {sec['title']}")
-        full_text_lines.append(sec["text"].strip())
-        full_text_lines.append("")
-
-    if research.get("sources"):
-        full_text_lines.append("Sources")
-        for s in research["sources"]:
-            if s.get("title") and s.get("url"):
-                full_text_lines.append(f"- {s['title']} - {s['url']}")
-
-    final_text = "\n".join(full_text_lines).strip()
-
-    # Exports
     slug = metadata["url_slug"] or slugify(heading)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     do_txt = output_format in {"txt", "all"}
     do_docx = output_format in {"docx", "all"}
     do_pdf = output_format in {"pdf", "all"}
+
+    style_opts = {
+        "font_family": font_family,
+        "base_font_size": base_font_size,
+        "h1_size": h1_size,
+        "h2_size": h2_size,
+        "h3_size": h3_size,
+        "polish": polish,
+    }
 
     if do_txt:
         print("Exporting to txt...")
@@ -172,6 +173,7 @@ def cli(topic: str, heading: str, word_count: int, deep: str, output_format: str
             metadata=metadata,
             heading=heading,
             sections=generated_sections,
+            style_options=style_opts,
         )
 
     if do_pdf:
@@ -183,6 +185,7 @@ def cli(topic: str, heading: str, word_count: int, deep: str, output_format: str
             metadata=metadata,
             heading=heading,
             sections=generated_sections,
+            style_options=style_opts,
         )
 
     print("Blog generated successfully.")
