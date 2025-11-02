@@ -63,6 +63,80 @@ def generate_outline(topic: str, heading: str, target_word_count: int) -> List[D
     return outline
 
 
+def generate_dynamic_outline_from_research(
+    openai_api_key: str,
+    topic: str,
+    heading: str,
+    target_word_count: int,
+    research: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Generate a dynamic outline by clustering research findings into conceptual groups.
+
+    Uses OpenAI to cluster research insights, returns sections for each cluster.
+    Target 8-25 sections based on research density and complexity.
+    """
+    client = OpenAI(api_key=openai_api_key)
+
+    # Gather research evidence
+    evidence = build_tagged_evidence(research)
+    sources = "\n".join(evidence) or "Research insights will be incorporated based on general knowledge."
+
+    prompt = (
+        "Analyze the research evidence below to identify conceptual clusters (distinct sub-themes/angles).\n"
+        "Return JSON with 'clusters' as a list of {title, theme} objects (8-25 items).\n"
+        "Examples of cluster themes: definitions, methods, tools, case studies, challenges, trends, best practices, etc.\n"
+        f"Topic: {topic}\nHeading: {heading}\nTarget word count: ~{target_word_count}\n\n"
+        f"Research evidence:\n{sources}\n\n"
+        "Return ONLY valid JSON, no extra text."
+    )
+
+    try:
+        out = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a research analyst. Return valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(out.choices[0].message.content or "{}")
+        clusters = data.get("clusters", [])
+    except Exception:
+        # Fallback to traditional outline
+        clusters = []
+
+    if not clusters:
+        return generate_outline(topic, heading, target_word_count)
+
+    # Allocate word counts across clusters
+    intro_words = max(120, int(target_word_count * 0.12))
+    conclusion_words = max(120, int(target_word_count * 0.12))
+    body_words = max(200, target_word_count - intro_words - conclusion_words)
+
+    num_sections = len(clusters)
+    per_section = max(100, int(body_words / max(1, num_sections)))
+
+    outline: List[Dict[str, Any]] = []
+    outline.append({"level": "h2", "title": "Introduction", "target_words": intro_words})
+
+    # Add cluster-based sections
+    for c in clusters:
+        title = c.get("title", "Section")
+        outline.append({"level": "h2", "title": title, "target_words": per_section})
+
+    outline.append({"level": "h2", "title": "Conclusion", "target_words": conclusion_words})
+
+    # Occasionally add varied H3 subsections
+    h3_variants = ["Action Steps", "Quick Checklist", "Pro Tips", "Summary Points"]
+    h2_indices = [idx for idx, s in enumerate(outline) if s["level"] == "h2" and s["title"] not in {"Introduction", "Conclusion"}]
+    for j, h2_idx in enumerate(h2_indices[: max(1, len(h2_indices)//4)]):
+        subtitle = h3_variants[j % len(h3_variants)]
+        outline.insert(h2_idx + 1, {"level": "h3", "title": subtitle, "target_words": max(60, int(per_section * 0.3))})
+
+    return outline
+
+
 # ---------- Evidence tagging (Researcher) ----------
 
 def build_tagged_evidence(research: Dict[str, Any]) -> List[str]:

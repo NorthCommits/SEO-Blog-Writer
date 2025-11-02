@@ -13,6 +13,7 @@ from src.research import perform_research
 from src.seo import generate_metadata, slugify
 from src.content import (
     generate_outline,
+    generate_dynamic_outline_from_research,
     generate_section_text,
     polish_sections,
     select_structure_template,
@@ -101,7 +102,19 @@ def cli(topic: str, heading: str, word_count: int, deep: str, output_format: str
     print(f"Found {len(research.get('sources', []))} sources.")
 
     print("Building outline and metadata...")
-    outline = generate_outline(topic=topic, heading=heading, target_word_count=word_count)
+    # Use dynamic outline in deep research mode
+    if deep_flag:
+        print("Clustering research into conceptual groups...")
+        outline = generate_dynamic_outline_from_research(
+            openai_api_key=openai_key,
+            topic=topic,
+            heading=heading,
+            target_word_count=word_count,
+            research=research,
+        )
+        print(f"Generated dynamic outline with {len([s for s in outline if s['level'] == 'h2'])} major sections.")
+    else:
+        outline = generate_outline(topic=topic, heading=heading, target_word_count=word_count)
 
     metadata = generate_metadata(
         topic=topic,
